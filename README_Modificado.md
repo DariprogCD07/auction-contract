@@ -39,7 +39,7 @@ Permitir que múltiples usuarios participen en una subasta con ETH, respetando l
 
 ## 🚀 Despliegue
 
-1. Compilar con Solidity 0.8.20.
+1. Compilar con Solidity 0.8.26.
 2. Desplegar en la red Sepolia (por ejemplo, usando Remix o Hardhat).
 3. Verificar el contrato en Etherscan Sepolia.
 4. Compartir la URL verificada en el Campus.
