@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title Auction Contract
+ * @notice Implements a transparent auction system with automatic refunds for non-winning bidders
+ * @dev Features include:
+ * - Time extensions on late bids
+ * - Minimum 5% bid increments
+ * - 2% commission on bids
+ * - Secure withdrawal patterns
+ * - Automatic refunds for non-winning bidders
+ */
+contract Auction {
+    event FundsRetrieved(address user, uint amount);
+    /// @dev The address of the contract owner
+    address private owner;
+
+    /// @dev Timestamp when auction bidding ends
+    uint private deadline;
+
+    /// @dev Fixed commission percentage taken on bids
+    /// @notice Value is 2 representing 2% commission
+    /// @custom:immutable Set at compile time, cannot be changed
+    uint private constant commissionPercent = 2; // 2% commission
+
+    /// @dev Duration added to deadline when last-minute bids occur
+    /// @notice Set to 10 minutes in seconds (600)
+    /// @custom:invariant Always extends auction by this exact duration
+    uint private constant timeExtension = 10 minutes;
+
+    /// @dev Flag indicating auction completion status
+    /// @notice Once true, prevents further state changes
+    /// @custom:transition Only changes from false → true once
+    bool private ended;
+
+    /**
+     * @title Bid Structure
+     * @notice Represents a single bid in the auction system
+     * @dev Contains bidder address and bid amount
+     */
+    struct Bid {
+        /// @notice Address of the bidder who placed this bid
+        address bidder;
+        
+        /// @notice Amount of ETH bid (in wei)
+        /// @dev Must be higher than previous bids to be valid
+        uint amount;
+    }
+
+    /// @dev Complete history of all valid bids received
+    /// @notice Array stores Bid structs in chronological order
+    Bid[] private biddingLog;
+
+    /// @dev Current highest valid bid in the auction
+    /// @custom:invariant amount must be >= reserve price
+    Bid private topBid;
+
+    /// @dev Tracks the total accumulated bid amount per address
+    mapping(address => uint) private totalFundsPerUser;
+    
+    /// @dev Stores the history of all bid amounts per address
+    mapping(address => uint[]) private userBids;
+    
+    /// @dev Tracks refundable amounts (98% of bids) per address
+    mapping(address => uint) public pendingReturns;
+
+    /**
+     * @dev Emitted when a new bid is placed
+     * @param bidder The address of the bidder (indexed for filtering)
+     * @param amount The amount of ETH bid (in wei)
+     */
+    event BidPlaced(address indexed bidder, uint amount);
+
+    /**
+     * @dev Emitted when a bidder places a bid that creates excess funds
+     * @param bidder Address of the bidder with excess funds (indexed)
+     * @param amount Amount of excess ETH available for withdrawal
+     */
+    event ExcessFundsAvailable(address indexed bidder, uint amount);
+
+    /**
+     * @dev Emitted when the auction concludes
+     * @param winner The address of the winning bidder
+     * @param winningAmount The final winning bid amount (in wei)
+     */
+    event BiddingClosed(address winner, uint winningAmount);
+
+    /**
+     * @dev Emitted when a bidder withdraws excess funds
+     * @param bidder Address receiving the partial refund (indexed)
+     * @param amount Amount refunded
+     */
+    event PartialRefund(address indexed bidder, uint amount);
+
+    /**
+     * @dev Emitted when users withdraw their deposits
+     * @param user The address withdrawing funds (indexed)
+     * @param refundAmount The amount returned to user (98%)
+     * @param fee The fee retained by contract (2%)
+     */
+    event DepositWithdrawn(address indexed user, uint refundAmount, uint fee);
+
+    /**
+     * @dev Emitted when contract funds are withdrawn under emergency
+     * @param receiver The destination address for emergency funds
+     * @param amount The amount of ETH withdrawn in wei
+     */
+    event EmergencyWithdraw(address indexed receiver, uint amount);
+
+    /**
+     * @dev Emitted when non-winning bids are automatically refunded
+     * @param bidder The address receiving the refund (indexed)
+     * @param refundAmount The amount returned to bidder (98%)
+     * @param fee The commission retained by contract (2%)
+     */
+    event DepositRefunded(address indexed bidder, uint refundAmount, uint fee);
+
+    /**
+     * @dev Modifier to check if the auction is still active
+     * @notice Reverts if the current time is past the auction deadline
+     * @custom:reverts BiddingClosed if auction deadline has passed
+     */
+    modifier auctionActive() {
+        require(block.timestamp < deadline, "Auction has ended");
+        _;
+    }
+
+    /**
+     * @dev Modifier to restrict access to the contract owner only
+     * @notice Reverts if caller is not the current contract owner
+     * @custom:reverts NotOwner if called by non-owner
+     */
+    modifier restrictedToOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    /**
+     * @notice Initializes the auction contract
+     * @dev Sets the owner and calculates the auction deadline
+     * @param _durationSeconds The duration of the auction in seconds from deployment
+     */
+    constructor(uint _durationSeconds) {
+        owner = msg.sender;
+        deadline = block.timestamp + _durationSeconds;
+    }
+
+    /**
+     * @notice Places a new bid in the auction
+     * @dev Requirements:
+     *      - Auction must still be active
+     *      - Bid value must be > 0
+     *      - For non-first bids: must be 5% higher than current highest
+     *      - Bidder cannot be current highest bidder
+     * @dev Effects:
+     *      - Updates accumulated bids for sender
+     *      - May update highest bid
+     *      - May extend auction deadline
+     * @custom:reverts BidTooLow if bid doesn't meet minimum requirements
+     * @custom:reverts BiddingClosed if auction deadline has passed
+     */
+    function makeBid() external payable auctionActive {
+        require(msg.value > 0, "Bid must be > 0");
+
+        if (topBid.amount == 0) {
+            totalFundsPerUser[msg.sender] = msg.value;
+            userBids[msg.sender].push(msg.value);
+            topBid = Bid(msg.sender, msg.value);
+            biddingLog.push(topBid);
+            emit BidPlaced(msg.sender, msg.value);
+            return;
+        }
+
+        require(msg.sender != topBid.bidder, "Already highest bidder");
+        uint requiredAmount = topBid.amount + (topBid.amount * 5) / 100;
+        uint newTotalBid = totalFundsPerUser[msg.sender] + msg.value;
+        require(newTotalBid > requiredAmount, "Bid must be 5% higher");
+
+        uint excess = 0;
+        if (totalFundsPerUser[msg.sender] > requiredAmount) {
+            excess = totalFundsPerUser[msg.sender] - requiredAmount;
+        }
+
+        totalFundsPerUser[msg.sender] = newTotalBid;
+        userBids[msg.sender].push(msg.value);
+
+        if (excess > 0) {
+            emit ExcessFundsAvailable(msg.sender, excess);
+        }
+
+        if (newTotalBid > topBid.amount) {
+            topBid = Bid(msg.sender, newTotalBid);
+            biddingLog.push(topBid);
+            
+            if (deadline - block.timestamp <= timeExtension) {
+                deadline += timeExtension;
+            }
+        }
+
+        emit BidPlaced(msg.sender, newTotalBid);
+    }
+
+    /**
+     * @notice Finalizes the auction and distributes funds
+     * @dev Requirements:
+     *      - Only callable by owner
+     *      - Auction must be past deadline
+     *      - Auction must not have already ended
+     *      - At least one valid bid must exist
+     * @dev Effects:
+     *      - Marks auction as ended
+     *      - Transfers winning bid (minus 2%) to owner
+     *      - Automatically refunds 98% to non-winning bidders
+     * @custom:reverts NotOwner if called by non-owner
+     * @custom:reverts AuctionNotEnded if current time < deadline
+     * @custom:reverts AuctionAlreadyEnded if auction was already finalized
+     * @custom:reverts NoBids if no bids were placed
+     */
+    function endAuction() external restrictedToOwner {
+        require(block.timestamp >= deadline, "Auction not ended");
+        require(!ended, "Auction already ended");
+        require(topBid.amount > 0, "No bids placed");
+
+        ended = true;
+        uint commission = (topBid.amount * commissionPercent) / 100;
+        payable(owner).transfer(topBid.amount - commission);
+
+        emit BiddingClosed(topBid.bidder, topBid.amount);
+
+        for (uint i = 0; i < biddingLog.length; i++) {
+            address bidder = biddingLog[i].bidder;
+            if (bidder != topBid.bidder && totalFundsPerUser[bidder] > 0) {
+                uint amount = totalFundsPerUser[bidder];
+                uint refundAmount = amount - (amount * commissionPercent) / 100;
+                
+                totalFundsPerUser[bidder] = 0;
+                payable(bidder).transfer(refundAmount);
+                
+                emit DepositRefunded(bidder, refundAmount, (amount * commissionPercent) / 100);
+            }
+        }
+    }
+
+    /**
+     * @notice Allows bidders to withdraw refundable deposits
+     * @dev Requirements:
+     *      - Auction must have ended
+     *      - Caller must have refundable balance
+     * @dev Effects:
+     *      - Transfers 98% of caller's total bids
+     *      - Resets caller's pending withdrawal balance
+     * @return success True if withdrawal was successful
+     * @custom:reverts AuctionNotEnded if auction is still active
+     * @custom:reverts NoRefund if no refund available
+     */
+    function retrieveFunds() external returns (bool success) {
+        require(ended, "Auction not ended");
+        uint amount = pendingReturns[msg.sender];
+        require(amount > 0, "No refund available");
+
+        pendingReturns[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+
+        emit DepositWithdrawn(
+            msg.sender,
+            amount,
+            (amount * commissionPercent) / 98
+        );
+        
+        return true;
+    }
+
+    /**
+     * @notice Allows withdrawal of excess bid amounts
+     * @dev Requirements:
+     *      - Auction must be active
+     *      - Caller must have excess funds
+     *      - Caller must not be current highest bidder
+     * @return success True if withdrawal was successful
+     * @custom:reverts BiddingClosed if auction has ended
+     * @custom:reverts NoExcessFunds if no excess available
+     * @custom:reverts CurrentHighestBidder if caller is highest bidder
+     */
+    function withdrawSurplus() external auctionActive returns (bool success) {
+        uint currentRequired = topBid.amount + (topBid.amount * 5) / 100;
+        uint excessAmount = totalFundsPerUser[msg.sender] - currentRequired;
+        
+        require(excessAmount > 0, "No excess funds available");
+        require(msg.sender != topBid.bidder, "Current highest bidder cannot withdraw");
+
+        totalFundsPerUser[msg.sender] = currentRequired;
+        payable(msg.sender).transfer(excessAmount);
+
+        emit PartialRefund(msg.sender, excessAmount);
+        return true;
+    }
+
+    /**
+     * @notice Emergency withdrawal of contract funds
+     * @dev Requirements:
+     *      - Only callable by owner
+     *      - Auction must have ended
+     * @custom:reverts NotOwner if called by non-owner
+     * @custom:reverts AuctionNotEnded if auction is still active
+     */
+    function emergencyWithdraw() external restrictedToOwner {
+        require(ended, "Auction not ended");
+        payable(owner).transfer(address(this).balance);
+        emit EmergencyWithdraw(owner, address(this).balance);
+    }
+
+    // ====================== VIEW FUNCTIONS ====================== //
+
+    /**
+     * @notice Returns current highest bid information
+     * @return bidder Address of current highest bidder
+     * @return amount Amount of current highest bid in wei
+     */
+    function getHighestBid() external view returns (address bidder, uint amount) {
+        return (topBid.bidder, topBid.amount);
+    }
+
+    /**
+     * @notice Returns the complete bid history
+     * @return Array of all historical highest bids
+     */
+    function getBidHistory() external view returns (Bid[] memory) {
+        return biddingLog;
+    }
+
+    /**
+     * @notice Returns remaining auction time
+     * @return remainingTime Seconds until auction ends (0 if ended)
+     */
+    function timeRemaining() external view returns (uint remainingTime) {
+        if (block.timestamp >= deadline) return 0;
+        return deadline - block.timestamp;
+    }
+
+   /**
+ * @notice Returns all bid amounts made by a specific user.
+ * @param user The address of the user.
+ * @return bids Array of bid amounts made by the user.
+ */
+function bidsOf(address user) external view returns (uint[] memory bids) {
+    return userBids[user];
+}
+
+    /**
+     * @notice Returns auction deadline timestamp
+     * @return auctionDeadline The block timestamp when auction ends
+     */
+    function getDeadline() external view returns (uint auctionDeadline) {
+        return deadline;
+    }
+
+    /**
+     * @notice Returns contract owner address
+     * @return contractOwner The owner address
+     */
+    function getOwner() external view returns (address contractOwner) {
+        return owner;
+    }
+
+    /**
+     * @notice Checks if auction has ended
+     * @return endedStatus True if auction ended, false otherwise
+     */
+    function isEnded() external view returns (bool endedStatus) {
+        return ended;
+    }
+
+    /**
+     * @notice Returns total bids for a user
+     * @param user Address to query
+     * @return totalBidAmount Sum of all bids placed by user
+     */
+    function totalBidOf(address user) external view returns (uint totalBidAmount) {
+        return totalFundsPerUser[user];
+    }
+}
